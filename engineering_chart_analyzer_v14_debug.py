@@ -1,9 +1,4 @@
-"""Launch v1.4 with the three requested DEBUG UI/spec fixes.
-
-This wrapper keeps the existing application and only adds a scrollable control
-panel, explicit in-cell editing for Multi Spec, robust CSV import, and
-order-independent spec range validation.
-"""
+"""Launch v1.4 with the three requested DEBUG UI/spec fixes and safe deduplication."""
 from __future__ import annotations
 
 import sys
@@ -11,9 +6,10 @@ from pathlib import Path
 
 import pandas as pd
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QAbstractItemView, QApplication, QFileDialog, QMessageBox, QScrollArea, QSplitter, QTableWidget
+from PySide6.QtWidgets import QAbstractItemView, QApplication, QFileDialog, QScrollArea, QSplitter, QTableWidget, QTableWidgetItem
 
 import engineering_charts as chart_logic
+from deduplication_fix import deduplicate_units
 
 
 def validate_spec_ranges(spec_rows, categories):
@@ -31,14 +27,14 @@ def validate_spec_ranges(spec_rows, categories):
         if positions[start] > positions[end]:
             raise ValueError(f"Start Point must not come after End Point on the selected X-axis: {start} – {end}.")
         populated.append(row)
-    # Sorting by axis index makes input/CSV row order irrelevant. The core
-    # validator still checks overlaps, limits, and numeric values.
     populated.sort(key=lambda row: positions[str(row["Start Point"]).strip()])
     return _original_validate_spec_ranges(populated, categories)
 
 
 _original_validate_spec_ranges = chart_logic.validate_spec_ranges
 chart_logic.validate_spec_ranges = validate_spec_ranges
+# Patch before the application imports its function reference.
+chart_logic.deduplicate_units = deduplicate_units
 
 import engineering_chart_analyzer as application
 
@@ -48,7 +44,6 @@ def _read_specs_csv(self):
     if not path:
         return
     try:
-        # Excel in some locales writes semicolon-separated fields and decimal commas.
         first_line = Path(path).read_text(encoding="utf-8-sig", errors="replace").splitlines()[0]
         separator = max((",", ";", "\t"), key=lambda candidate: first_line.count(candidate))
         frame = pd.read_csv(path, sep=separator, decimal="," if separator == ";" else ".", encoding="utf-8-sig")
@@ -61,9 +56,7 @@ def _read_specs_csv(self):
         for row_index, (_, record) in enumerate(frame.iterrows()):
             for column_index, name in enumerate(required):
                 value = record[name]
-                text = "" if pd.isna(value) else str(value)
-                from PySide6.QtWidgets import QTableWidgetItem
-                self.spec_table.setItem(row_index, column_index, QTableWidgetItem(text))
+                self.spec_table.setItem(row_index, column_index, QTableWidgetItem("" if pd.isna(value) else str(value)))
         self._progress(100, f"Imported {len(frame)} spec ranges; row order will be matched to the selected X-axis.")
     except Exception as exc:
         self._error(str(exc))
@@ -74,8 +67,6 @@ _original_init = application.EngineeringChartWindow.__init__
 
 def _init_with_debug_fixes(self, *args, **kwargs):
     _original_init(self, *args, **kwargs)
-    # Make the complete data-entry side vertically scrollable without shrinking
-    # the existing controls when the window is short or the spec table grows.
     splitters = self.findChildren(QSplitter)
     if splitters:
         splitter = splitters[0]
@@ -93,11 +84,7 @@ def _init_with_debug_fixes(self, *args, **kwargs):
             self.input_scroll_area = scroll
     for table in self.findChildren(QTableWidget):
         if table.columnCount() == 5:
-            table.setEditTriggers(
-                QAbstractItemView.EditTrigger.DoubleClicked
-                | QAbstractItemView.EditTrigger.EditKeyPressed
-                | QAbstractItemView.EditTrigger.AnyKeyPressed
-            )
+            table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked | QAbstractItemView.EditTrigger.EditKeyPressed | QAbstractItemView.EditTrigger.AnyKeyPressed)
             table.setTabKeyNavigation(True)
             table.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
