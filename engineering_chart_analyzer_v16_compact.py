@@ -3,14 +3,17 @@ from __future__ import annotations
 
 import sys
 from io import BytesIO
+from pathlib import Path
 
-import numpy as np
 import pandas as pd
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 from matplotlib.figure import Figure
 from PySide6.QtCore import QEvent, QObject, Qt
 from PySide6.QtGui import QAction, QIcon, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import QApplication, QScrollArea, QSizePolicy, QSplitter
+from PySide6.QtWidgets import (
+    QAbstractItemView, QApplication, QInputDialog, QScrollArea, QSizePolicy,
+    QSplitter, QTableWidgetSelectionRange,
+)
 
 # Load the existing v1.6 charts/reports and prior CSV/spec/dedup fixes.
 import engineering_chart_analyzer_v16_debug as v16
@@ -19,6 +22,11 @@ import engineering_charts as chart_logic
 
 VERSION = "1.6"
 _BOX_CONTEXT = None
+
+# Keep immutable references to the original renderers before installing wrappers.
+_ORIGINAL_RENDER_V16_CHART = v16.render_v16_chart
+_ORIGINAL_RENDER_V16_FACET = v16.render_v16_facet
+_ORIGINAL_DRAW_SPECS = chart_logic._draw_specs
 
 
 def _zoom_icon(sign: str) -> QIcon:
@@ -138,8 +146,7 @@ def _apply_spec_visibility(window):
     window.spec_table.setVisible(multi)
     if table_label is not None:
         table_label.setVisible(multi)
-    # The buttons share the controls QWidget as parent (they are in a QHBoxLayout),
-    # so hiding their parent would blank the entire parameter panel.
+    # Spec buttons share the controls QWidget as parent; hide buttons individually.
     for button in getattr(window, "_spec_buttons", []):
         button.setVisible(multi)
 
@@ -148,10 +155,33 @@ def _apply_spec_visibility(window):
 app_module.EngineeringChartWindow._apply_v16_spec_visibility = _apply_spec_visibility
 
 
+def _draw_specs_with_target_label(ax, columns, specs):
+    """Draw spec lines and their numeric Target/Nominal labels on the source figure."""
+    _ORIGINAL_DRAW_SPECS(ax, columns, specs)
+    for spec in specs:
+        value = spec.get("Target")
+        if value is None:
+            continue
+        lo, hi = spec["start_index"], spec["end_index"]
+        ax.annotate(
+            f"Target/Nominal: {value:g}",
+            xy=((lo + hi) / 2, value),
+            xytext=(0, 5),
+            textcoords="offset points",
+            color="#168447",
+            fontsize=7,
+            ha="center",
+            va="bottom",
+        )
+
+
+chart_logic._draw_specs = _draw_specs_with_target_label
+
+
 def render_boxplot_facets(data, columns, *, vendor_column, facet_column="", figure=None,
                           vendor_values=None, facet_values=None, spec_ranges=None,
                           spec_mode="Single Spec", usl=None, lsl=None, target=None):
-    """Render one box-plot panel per selected Vendor × Breakdown combination."""
+    """Render the existing Box Plot as one panel per Vendor × Breakdown pair."""
     columns = list(columns)
     if not columns:
         raise ValueError("Select at least one numeric measurement column.")
@@ -179,8 +209,10 @@ def render_boxplot_facets(data, columns, *, vendor_column, facet_column="", figu
             distributions = [values.loc[mask, name].dropna().to_numpy(dtype=float) for name in columns]
             nonempty = [idx for idx, array in enumerate(distributions) if len(array)]
             if nonempty:
+                # Use the long-supported labels argument for Matplotlib 3.8 compatibility.
                 ax.boxplot([distributions[idx] for idx in nonempty], positions=nonempty,
-                           tick_labels=[columns[idx] for idx in nonempty], showfliers=True)
+                           labels=[columns[idx] for idx in nonempty], showfliers=True,
+                           flierprops={"markersize": 3})
             else:
                 ax.text(.5, .5, "No measurements", ha="center", va="center", transform=ax.transAxes)
             chart_logic._draw_specs(ax, columns, specs)
@@ -196,15 +228,81 @@ def render_boxplot_facets(data, columns, *, vendor_column, facet_column="", figu
 
 
 def _render_chart_with_box_facets(*args, **kwargs):
+    """Route Box Plot to facets and all other charts to the captured v1.6 renderer."""
     if len(args) >= 3 and args[2] == "Box Plot by Vendor" and _BOX_CONTEXT:
         return render_boxplot_facets(args[0], args[1], figure=kwargs.get("figure"), **_BOX_CONTEXT)
-    return v16.render_v16_chart(*args, **kwargs)
+    # Do not call v16.render_v16_chart here: that public name is patched below.
+    return _ORIGINAL_RENDER_V16_CHART(*args, **kwargs)
 
 
-# Patch the references used by the application and v1.6 wrapper.
-chart_logic.render_chart = _render_chart_with_box_facets
+# Patch only the application-facing generic renderer. Keep v16's public function intact.
 app_module.render_chart = _render_chart_with_box_facets
-v16.render_v16_chart = _render_chart_with_box_facets
+chart_logic.render_chart = _render_chart_with_box_facets
+
+
+def _read_insight_raw_sheet(path, sheet_name):
+    """Read Insight Raw with Excel row 2 as headers and discard blank column-C rows."""
+    raw = pd.read_excel(path, sheet_name=sheet_name, header=1)
+    if raw.shape[1] < 3:
+        raise ValueError("Insight Raw data must contain at least three columns.")
+    column_c = raw.iloc[:, 2]
+    keep = column_c.notna() & column_c.astype(str).str.strip().ne("")
+    return raw.loc[keep].reset_index(drop=True)
+
+
+def _open_measurements_with_template(self):
+    """Choose an import template while leaving the established PE reader untouched."""
+    try:
+        path, _ = app_module.QFileDialog.getOpenFileName(
+            self, "Open measurement workbook", "", "Excel (*.xlsx *.xlsm)"
+        )
+        if not path:
+            return
+        template, ok = QInputDialog.getItem(
+            self,
+            "Select measurement data template",
+            "Data template:",
+            ["Fleet Data - PE Format", "Fleet Data - Insight Raw"],
+            0,
+            False,
+        )
+        if not ok:
+            return
+
+        sheets = pd.ExcelFile(path).sheet_names
+        dialog = app_module.MultiSheetDialog(sheets, self)
+        if dialog.exec() != app_module.QDialog.DialogCode.Accepted:
+            return
+        chosen = dialog.selected()
+        if not chosen:
+            return
+        if len(chosen) > 1 and app_module.QMessageBox.question(
+            self,
+            "Open selected sheets?",
+            f"Open {len(chosen)} sheets in separate windows?",
+            app_module.QMessageBox.StandardButton.Yes | app_module.QMessageBox.StandardButton.Cancel,
+        ) == app_module.QMessageBox.StandardButton.Cancel:
+            return
+
+        for sheet in chosen:
+            if template == "Fleet Data - PE Format":
+                # Preserve the project's existing PE detection algorithm verbatim.
+                frame = self._read_measurement(path, sheet)
+            else:
+                frame = _read_insight_raw_sheet(path, sheet)
+            if len(chosen) == 1:
+                self._set_measurements(Path(path), frame, sheet)
+            else:
+                window = app_module.EngineeringChartWindow()
+                window._set_measurements(Path(path), frame, sheet)
+                window.show()
+                self._child_windows.append(window)
+        self._progress(100, f"Loaded {len(chosen)} sheet(s); each sheet has its own window.")
+    except Exception as exc:
+        self._error(str(exc))
+
+
+app_module.EngineeringChartWindow.open_measurements = _open_measurements_with_template
 
 
 def _render_large_preview(self):
@@ -230,13 +328,10 @@ def _set_commonality_headers(window):
     frame = getattr(window, "_last_summary", None)
     if frame is None or len(frame.columns) < 2:
         return
-    # The summary's first two fields are the group values, irrespective of the
-    # source workbook's field names. Preserve these names for downstream exports.
     columns = list(frame.columns)
     columns[0] = "Vendor"
     columns[1] = "Breakdown"
     frame.columns = columns
-
     headers = [str(column) for column in frame.columns]
     vendor_field = window.vendor_column.currentText() or "Vendor"
     breakdown_field = window.facet_column.currentText() or "All units"
@@ -246,12 +341,82 @@ def _set_commonality_headers(window):
         window.summary_table.setHorizontalHeaderLabels(headers)
 
 
+def _filter_by_selected_fail_sn(data, key_column, selected_sns):
+    """Filter all measurement rows by SN only, never by Fail Position."""
+    if not key_column or key_column not in data:
+        return data.iloc[0:0].copy()
+    selected = {str(value) for value in selected_sns}
+    if not selected:
+        return data.iloc[0:0].copy()
+    return data.loc[data[key_column].astype("object").astype(str).isin(selected)].copy()
+
+
+def _selected_fail_sns(window):
+    selected_rows = window.fail_table.selectionModel().selectedRows()
+    result = []
+    for model_index in selected_rows:
+        item = window.fail_table.item(model_index.row(), 0)
+        if item is not None:
+            result.append(item.text())
+    return result
+
+
+def _rerender_selected_fail_sns(window):
+    if not getattr(window, "_fail_filter_ready", False):
+        return
+    if not window.fail_toggle.isChecked() or not getattr(window, "_failure_chart_data", None) is not None:
+        return
+    selected = _selected_fail_sns(window)
+    data = _filter_by_selected_fail_sn(
+        window._failure_chart_data, window._failure_key_column, selected
+    )
+    figures = {}
+    if data.empty:
+        for chart_name in window._failure_chart_names:
+            figure = Figure(figsize=(12, 7))
+            axis = figure.add_subplot(111)
+            axis.text(.5, .5, "No Fail SN selected", ha="center", va="center", transform=axis.transAxes)
+            axis.set_axis_off()
+            figures[chart_name] = figure
+    else:
+        context = window._failure_render_context
+        for chart_name in window._failure_chart_names:
+            figure = Figure(figsize=(12, 7))
+            common = dict(
+                usl=context["usl"], lsl=context["lsl"], target=context["target"],
+                spec_ranges=context["specs"], spec_mode=context["spec_mode"],
+                figure=figure,
+            )
+            if chart_name == "Multi-Line Trend Chart" and context["vendor"]:
+                _ORIGINAL_RENDER_V16_FACET(
+                    data, context["columns"], vendor_column=context["vendor"],
+                    facet_column=context["facet"], sample_limit=context["sample_limit"],
+                    vendor_values=context["vendor_values"], facet_values=context["facet_values"],
+                    highlight_oos=context["highlight_oos"], **common,
+                )
+            elif chart_name == "Box Plot by Vendor":
+                render_boxplot_facets(
+                    data, context["columns"], vendor_column=context["vendor"],
+                    facet_column=context["facet"], vendor_values=context["vendor_values"],
+                    facet_values=context["facet_values"], **common,
+                )
+            else:
+                _ORIGINAL_RENDER_V16_CHART(
+                    data, context["columns"], chart_name, group_column=context["vendor"],
+                    sample_limit=context["sample_limit"], highlight_oos=context["highlight_oos"], **common,
+                )
+            figures[chart_name] = figure
+    window._chart_figures = figures
+    window._chart_data = data
+    window._render_page()
+
+
 _original_build = app_module.EngineeringChartWindow.build_charts
 
 
-def _build_with_pair_facets(self, *args, **kwargs):
+def _build_with_pair_facets_and_fail_filter(self, *args, **kwargs):
     global _BOX_CONTEXT
-    # Match the selections passed to the Multi-Line facet renderer.
+    self._fail_filter_ready = False
     _BOX_CONTEXT = {
         "vendor_column": self.vendor_column.currentText(),
         "facet_column": self.facet_column.currentText(),
@@ -266,12 +431,32 @@ def _build_with_pair_facets(self, *args, **kwargs):
     try:
         result = _original_build(self, *args, **kwargs)
         _set_commonality_headers(self)
+        if getattr(self, "_chart_data", None) is not None:
+            self._failure_chart_data = self._chart_data.copy()
+            self._failure_key_column = self.unit_key.currentText()
+            self._failure_chart_names = list(getattr(self, "_chart_names", []))
+            self._failure_render_context = {
+                "columns": self.selected_columns(),
+                "vendor": self.vendor_column.currentText(),
+                "facet": self.facet_column.currentText(),
+                "vendor_values": self.checked(self.vendor_values),
+                "facet_values": self.checked(self.facet_values),
+                "usl": _BOX_CONTEXT["usl"], "lsl": _BOX_CONTEXT["lsl"],
+                "target": _BOX_CONTEXT["target"], "specs": list(getattr(self, "_last_specs", [])),
+                "spec_mode": _BOX_CONTEXT["spec_mode"],
+                "sample_limit": max(25, int(self.sample.text() or 350)),
+                "highlight_oos": self.fail_toggle.isChecked(),
+            }
+            self._fail_filter_ready = True
+            if self.fail_toggle.isChecked() and self.fail_table.rowCount():
+                self.fail_table.selectAll()
+                _rerender_selected_fail_sns(self)
         return result
     finally:
         _BOX_CONTEXT = None
 
 
-app_module.EngineeringChartWindow.build_charts = _build_with_pair_facets
+app_module.EngineeringChartWindow.build_charts = _build_with_pair_facets_and_fail_filter
 
 
 _original_init = app_module.EngineeringChartWindow.__init__
@@ -283,10 +468,12 @@ def _compact_init(self, *args, **kwargs):
     if hasattr(self, "version"):
         self.version.setText(f"version {VERSION} - designed and developed by Hiro Nguyen")
     _restore_parameter_panel(self)
-
-    # The earlier base handler changes only individual spec controls, not the
-    # parent panel; the v1.6 handler is likewise safe after the class override.
     self._apply_v16_spec_visibility()
+
+    self._fail_filter_ready = False
+    self.fail_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+    self.fail_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+    self.fail_table.itemSelectionChanged.connect(lambda: _rerender_selected_fail_sns(self))
 
     for name in ("zoom_in_button", "zoom_out_button", "zoom_reset_button"):
         widget = getattr(self, name, None)
