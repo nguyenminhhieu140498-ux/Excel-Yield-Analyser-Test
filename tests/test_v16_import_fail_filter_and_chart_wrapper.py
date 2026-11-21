@@ -21,23 +21,11 @@ def test_original_renderer_fallback_does_not_recurse():
 
 
 def test_insight_raw_reader_uses_second_excel_row_and_drops_blank_column_c(monkeypatch):
-    source = pd.DataFrame([
-        ["unused", "unused", "unused"],
-        ["SN", "Vendor", "Measurement"],
-        ["A", "V1", 1.2],
-        ["B", "V2", None],
-        ["C", "V3", "   "],
-    ])
     observed = {}
-
-    def fake_read_excel(path, sheet_name, header):
-        observed.update(path=path, sheet_name=sheet_name, header=header)
-        return source.iloc[1:].set_axis(source.iloc[1].tolist(), axis=1).iloc[1:].reset_index(drop=True)
-
-    # Simulate pandas' normal header=1 result, including one blank and one whitespace cell in C.
     frame = pd.DataFrame({"SN": ["A", "B", "C"], "Vendor": ["V1", "V2", "V3"],
                           "Measurement": [1.2, None, "   "]})
-    monkeypatch.setattr(compact.pd, "read_excel", lambda *args, **kwargs: (observed.update(kwargs) or frame.copy()))
+    monkeypatch.setattr(compact.pd, "read_excel",
+                        lambda *args, **kwargs: (observed.update(kwargs) or frame.copy()))
     cleaned = compact._read_insight_raw_sheet("fleet.xlsx", "Raw")
     assert observed["header"] == 1
     assert cleaned["SN"].tolist() == ["A"]
@@ -68,4 +56,21 @@ def test_box_plot_facets_retain_vendor_breakdown_and_target_label():
         vendor_values=["A", "B"], facet_values=["X", "Y"], target=2.0, figure=Figure(),
     )
     assert len(fig.axes) == 4
+    assert all([tick.get_text() for tick in axis.get_xticklabels()] == ["M1"] or
+               [tick.get_text() for tick in axis.get_xticklabels()] == ["M1", "M2"]
+               for axis in fig.axes)
     assert all(any("Target/Nominal: 2" in text.get_text() for text in axis.texts) for axis in fig.axes)
+
+
+def test_boxplot_label_keyword_matches_installed_matplotlib():
+    import inspect
+
+    parameters = inspect.signature(Figure().add_subplot(111).boxplot).parameters
+    keyword = "tick_labels" if "tick_labels" in parameters else "labels"
+    assert keyword in {"labels", "tick_labels"}
+    fig = compact.render_boxplot_facets(
+        pd.DataFrame({"Vendor": ["V", "V"], "M": [1.0, 2.0]}),
+        ["M"], vendor_column="Vendor", vendor_values=["V"], figure=Figure(),
+    )
+    assert fig.axes
+    assert [tick.get_text() for tick in fig.axes[0].get_xticklabels()] == ["M"]

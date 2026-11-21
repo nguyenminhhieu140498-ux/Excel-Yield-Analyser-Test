@@ -1,6 +1,7 @@
 """Compact v1.6 launcher with parameter panel restoration and gesture zoom."""
 from __future__ import annotations
 
+import inspect
 import sys
 from io import BytesIO
 from pathlib import Path
@@ -12,7 +13,7 @@ from PySide6.QtCore import QEvent, QObject, Qt
 from PySide6.QtGui import QAction, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QInputDialog, QScrollArea, QSizePolicy,
-    QSplitter, QTableWidgetSelectionRange,
+    QSplitter,
 )
 
 # Load the existing v1.6 charts/reports and prior CSV/spec/dedup fixes.
@@ -178,6 +179,18 @@ def _draw_specs_with_target_label(ax, columns, specs):
 chart_logic._draw_specs = _draw_specs_with_target_label
 
 
+def _boxplot_with_compatible_labels(ax, distributions, positions, labels, **kwargs):
+    """Use the category-label keyword supported by the installed Matplotlib."""
+    parameters = inspect.signature(ax.boxplot).parameters
+    label_keyword = "tick_labels" if "tick_labels" in parameters else "labels"
+    return ax.boxplot(
+        distributions,
+        positions=positions,
+        **{label_keyword: labels},
+        **kwargs,
+    )
+
+
 def render_boxplot_facets(data, columns, *, vendor_column, facet_column="", figure=None,
                           vendor_values=None, facet_values=None, spec_ranges=None,
                           spec_mode="Single Spec", usl=None, lsl=None, target=None):
@@ -209,10 +222,14 @@ def render_boxplot_facets(data, columns, *, vendor_column, facet_column="", figu
             distributions = [values.loc[mask, name].dropna().to_numpy(dtype=float) for name in columns]
             nonempty = [idx for idx, array in enumerate(distributions) if len(array)]
             if nonempty:
-                # Use the long-supported labels argument for Matplotlib 3.8 compatibility.
-                ax.boxplot([distributions[idx] for idx in nonempty], positions=nonempty,
-                           labels=[columns[idx] for idx in nonempty], showfliers=True,
-                           flierprops={"markersize": 3})
+                _boxplot_with_compatible_labels(
+                    ax,
+                    [distributions[idx] for idx in nonempty],
+                    nonempty,
+                    [columns[idx] for idx in nonempty],
+                    showfliers=True,
+                    flierprops={"markersize": 3},
+                )
             else:
                 ax.text(.5, .5, "No measurements", ha="center", va="center", transform=ax.transAxes)
             chart_logic._draw_specs(ax, columns, specs)
@@ -231,7 +248,7 @@ def _render_chart_with_box_facets(*args, **kwargs):
     """Route Box Plot to facets and all other charts to the captured v1.6 renderer."""
     if len(args) >= 3 and args[2] == "Box Plot by Vendor" and _BOX_CONTEXT:
         return render_boxplot_facets(args[0], args[1], figure=kwargs.get("figure"), **_BOX_CONTEXT)
-    # Do not call v16.render_v16_chart here: that public name is patched below.
+    # Do not call v16.render_v16_chart here: that public name may be patched later.
     return _ORIGINAL_RENDER_V16_CHART(*args, **kwargs)
 
 
@@ -364,7 +381,7 @@ def _selected_fail_sns(window):
 def _rerender_selected_fail_sns(window):
     if not getattr(window, "_fail_filter_ready", False):
         return
-    if not window.fail_toggle.isChecked() or not getattr(window, "_failure_chart_data", None) is not None:
+    if not window.fail_toggle.isChecked() or getattr(window, "_failure_chart_data", None) is None:
         return
     selected = _selected_fail_sns(window)
     data = _filter_by_selected_fail_sn(
