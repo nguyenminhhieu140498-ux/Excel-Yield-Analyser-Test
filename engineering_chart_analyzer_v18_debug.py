@@ -57,12 +57,8 @@ def _norm_sn(value):
 
 
 def _failed_sn_keys(window, data, key_column, columns, specs):
-    failures = getattr(window, "_last_failures", None)
-    if failures is None or failures.empty:
-        failures = chart_logic.fail_sn_list(data, columns, key_column, specs)
-    if failures.empty or "Fail SN" not in failures:
-        return set()
-    return {_norm_sn(value) for value in failures["Fail SN"] if _norm_sn(value)}
+    """Derive failing serials from the current chart data and existing specs."""
+    return _failed_sn_keys_from_data(data, key_column, columns, specs)
 
 
 def _failed_sn_keys_from_data(data, key_column, columns, specs):
@@ -73,18 +69,36 @@ def _failed_sn_keys_from_data(data, key_column, columns, specs):
     return {_norm_sn(value) for value in failures["Fail SN"] if _norm_sn(value)}
 
 
-def _render_composed_chart_data(window, selected_fail_sns=()):
-    """Render all passing units plus only explicitly selected failing SNs."""
+def _compose_pass_fail_data(data, key_column, columns, specs, selected_fail_sns=None):
+    """Keep all passing rows; optionally limit failing rows to selected SNs.
+
+    ``None`` or an empty selection means the default view: all Pass and Fail
+    Units. A non-empty selection retains the complete Pass baseline and adds
+    only the selected failing serials.
+    """
+    if data is None or data.empty or not key_column or key_column not in data:
+        return data.copy() if isinstance(data, pd.DataFrame) else pd.DataFrame()
+
+    fail_keys = _failed_sn_keys_from_data(data, key_column, columns, specs)
+    normalized = data[key_column].map(_norm_sn)
+    failing_rows = normalized.isin(fail_keys)
+    if not selected_fail_sns:
+        return data.copy()
+
+    selected_keys = {_norm_sn(value) for value in selected_fail_sns if _norm_sn(value)}
+    keep = ~failing_rows | (failing_rows & normalized.isin(selected_keys))
+    return data.loc[keep].copy()
+
+
+def _render_composed_chart_data(window, selected_fail_sns=None):
+    """Render the Pass baseline and the default or selected Fail SN overlay."""
     source = getattr(window, "_v18_source_chart_data", None)
     if source is None or source.empty:
         return
     context = window._v18_chart_context
-    fail_keys = _failed_sn_keys(window, source, context["key"], context["columns"], context["specs"])
-    normalized = source[context["key"]].map(_norm_sn)
-    pass_data = source.loc[~normalized.isin(fail_keys)]
-    selected_keys = {_norm_sn(value) for value in selected_fail_sns if _norm_sn(value)}
-    selected_fail_data = source.loc[normalized.isin(selected_keys & fail_keys)]
-    chart_data = pd.concat([pass_data, selected_fail_data]).drop_duplicates().reset_index(drop=True)
+    chart_data = _compose_pass_fail_data(
+        source, context["key"], context["columns"], context["specs"], selected_fail_sns
+    )
 
     figures = {}
     for chart_name in context["chart_names"]:
@@ -96,7 +110,8 @@ def _render_composed_chart_data(window, selected_fail_sns=()):
                 chart_data, context["columns"], vendor_column=context["vendor"],
                 facet_column=context["facet"], sample_limit=context["sample_limit"],
                 vendor_values=context["vendor_values"], facet_values=context["facet_values"],
-                highlight_oos=context["highlight_oos"], **common,
+                # Always distinguish failing rows from the Pass baseline.
+                highlight_oos=True, **common,
             )
         elif chart_name == "Box Plot by Vendor":
             v16_compact.render_boxplot_facets(
@@ -127,7 +142,9 @@ def _selected_sns_from_table(window):
 
 def _fail_selection_changed(window):
     if getattr(window, "_v18_ready", False) and window.fail_toggle.isChecked():
-        _render_composed_chart_data(window, _selected_sns_from_table(window))
+        selected = _selected_sns_from_table(window)
+        # Clearing selection restores the default view with every Fail Unit.
+        _render_composed_chart_data(window, selected or None)
 
 
 def _build_charts_v18(self, *args, **kwargs):
@@ -151,7 +168,8 @@ def _build_charts_v18(self, *args, **kwargs):
     self._v18_ready = False
     self.fail_table.clearSelection()
     self._v18_ready = True
-    _render_composed_chart_data(self, _selected_sns_from_table(self))
+    # Build completes in the default state: all Pass and all Fail Units visible.
+    _render_composed_chart_data(self, None)
     return result
 
 
@@ -190,14 +208,15 @@ def _open_measurements_v18(self):
         ) == app_module.QMessageBox.StandardButton.Cancel:
             return
 
+        from pathlib import Path
         for sheet in chosen:
             frame = (self._read_measurement(path, sheet) if template == "Fleet Data - PE Format"
                      else read_insight_raw_sheet(path, sheet, header_row))
             if len(chosen) == 1:
-                self._set_measurements(__import__("pathlib").Path(path), frame, sheet)
+                self._set_measurements(Path(path), frame, sheet)
             else:
                 child = app_module.EngineeringChartWindow()
-                child._set_measurements(__import__("pathlib").Path(path), frame, sheet)
+                child._set_measurements(Path(path), frame, sheet)
                 child.show()
                 self._child_windows.append(child)
         self._progress(100, f"Loaded {len(chosen)} sheet(s); each sheet has its own window.")
