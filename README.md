@@ -1,6 +1,6 @@
-# Excel Yield Analyzer — v1.6
+# Excel Yield Analyzer — v1.8 Debug
 
-The v1.6 launcher keeps the existing workflow while using a compact chart toolbar. Zoom is available from the toolbar's magnifier icons and with the mouse wheel/trackpad on the chart. Hold **Control** while scrolling over a table to zoom its text; a trackpad pinch also zooms table text. Normal table scrolling is unchanged. The version label displays `v1.6` without the DEBUG suffix.
+V1.8 debug launcher retains the existing compact interface and import templates, keeps passing units on every chart, and adds only selected failing SN units to the chart. The Fail SN List occupies the former commonality-panel space. Target/Nominal keeps its green line and displays only its numeric value.
 
 ## Run with Python 3.15
 
@@ -10,5 +10,5 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 python -m pytest -v
-python engineering_chart_analyzer_v16_compact.py
+python engineering_chart_analyzer_v18_debug.py
 ```
