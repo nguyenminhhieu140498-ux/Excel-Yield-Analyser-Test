@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import pandas as pd
 from matplotlib.figure import Figure
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QHBoxLayout, QInputDialog, QMessageBox
+from PySide6.QtWidgets import QApplication, QHBoxLayout, QInputDialog
 
 import engineering_chart_analyzer_v16_compact as v16_compact
 import engineering_chart_analyzer as app_module
@@ -56,11 +56,6 @@ def _norm_sn(value):
     return chart_logic._norm_key(value)
 
 
-def _failed_sn_keys(window, data, key_column, columns, specs):
-    """Derive failing serials from the current chart data and existing specs."""
-    return _failed_sn_keys_from_data(data, key_column, columns, specs)
-
-
 def _failed_sn_keys_from_data(data, key_column, columns, specs):
     """Return normalized SNs that fail one or more selected measurement specs."""
     failures = chart_logic.fail_sn_list(data, columns, key_column, specs)
@@ -70,29 +65,74 @@ def _failed_sn_keys_from_data(data, key_column, columns, specs):
 
 
 def _compose_pass_fail_data(data, key_column, columns, specs, selected_fail_sns=None):
-    """Keep all passing rows; optionally limit failing rows to selected SNs.
-
-    ``None`` or an empty selection means the default view: all Pass and Fail
-    Units. A non-empty selection retains the complete Pass baseline and adds
-    only the selected failing serials.
-    """
+    """Retain all Pass Units and all or selected Fail Units from the full source."""
     if data is None or data.empty or not key_column or key_column not in data:
         return data.copy() if isinstance(data, pd.DataFrame) else pd.DataFrame()
-
     fail_keys = _failed_sn_keys_from_data(data, key_column, columns, specs)
     normalized = data[key_column].map(_norm_sn)
-    failing_rows = normalized.isin(fail_keys)
     if not selected_fail_sns:
         return data.copy()
-
     selected_keys = {_norm_sn(value) for value in selected_fail_sns if _norm_sn(value)}
-    keep = ~failing_rows | (failing_rows & normalized.isin(selected_keys))
+    keep = ~normalized.isin(fail_keys) | normalized.isin(selected_keys & fail_keys)
     return data.loc[keep].copy()
 
 
+def _capture_full_filtered_data(window):
+    """Recreate the pre-render V16 dedup and group filters from the full input.
+
+    This must run before the wrapped V16 Build Chart call. The chart cache may
+    already have had rendering-related filters applied and is not a trusted
+    source for Pass/Fail composition.
+    """
+    if window.data is None:
+        return None, None
+    columns = window.selected_columns()
+    if not columns:
+        return None, None
+
+    usl = None if window.multi_mode.isChecked() else window._number(window.usl)
+    target = None if window.multi_mode.isChecked() else window._number(window.target)
+    lsl = None if window.multi_mode.isChecked() else window._number(window.lsl)
+    spec_mode = "Multi Spec" if window.multi_mode.isChecked() else "Single Spec"
+    specs = chart_logic.spec_limits_for_columns(
+        columns, spec_mode, usl, target, lsl, window._spec_rows()
+    )
+
+    values = window.data[columns].apply(pd.to_numeric, errors="coerce")
+    failures = pd.Series(False, index=window.data.index, dtype=bool)
+    for spec in specs:
+        segment = values.iloc[:, spec["start_index"]:spec["end_index"] + 1]
+        if spec.get("USL") is not None:
+            failures |= segment.gt(spec["USL"]).any(axis=1)
+        if spec.get("LSL") is not None:
+            failures |= segment.lt(spec["LSL"]).any(axis=1)
+
+    key_column = window.unit_key.currentText()
+    deduplicated = chart_logic.deduplicate_units(
+        window.data, key_column, window.duplicate_mode.currentText(), failures.to_numpy()
+    )
+    vendor = window.vendor_column.currentText()
+    facet = window.facet_column.currentText()
+    filtered = deduplicated.copy()
+    if vendor in filtered:
+        vendor_values = filtered[vendor].astype("object").where(
+            filtered[vendor].notna(), "(blank)"
+        ).astype(str)
+        filtered = filtered.loc[vendor_values.isin(window.checked(window.vendor_values))]
+    if facet in filtered:
+        facet_values = filtered[facet].astype("object").where(
+            filtered[facet].notna(), "(blank)"
+        ).astype(str)
+        filtered = filtered.loc[facet_values.isin(window.checked(window.facet_values))]
+    return filtered.copy(), {
+        "key": key_column, "columns": columns, "specs": specs,
+        "usl": usl, "lsl": lsl, "target": target, "spec_mode": spec_mode,
+    }
+
+
 def _render_composed_chart_data(window, selected_fail_sns=None):
-    """Render the Pass baseline and the default or selected Fail SN overlay."""
-    source = getattr(window, "_v18_source_chart_data", None)
+    """Render chart data composed only from the preserved full filtered input."""
+    source = getattr(window, "_v18_full_filtered_data", None)
     if source is None or source.empty:
         return
     context = window._v18_chart_context
@@ -106,11 +146,12 @@ def _render_composed_chart_data(window, selected_fail_sns=None):
         common = dict(usl=context["usl"], lsl=context["lsl"], target=context["target"],
                       spec_ranges=context["specs"], spec_mode=context["spec_mode"], figure=figure)
         if chart_name == "Multi-Line Trend Chart" and context["vendor"]:
+            # This renderer plots every input row; highlight_oos changes styling
+            # only and does not filter Pass Units from chart_data.
             v16_compact._ORIGINAL_RENDER_V16_FACET(
                 chart_data, context["columns"], vendor_column=context["vendor"],
                 facet_column=context["facet"], sample_limit=context["sample_limit"],
                 vendor_values=context["vendor_values"], facet_values=context["facet_values"],
-                # Always distinguish failing rows from the Pass baseline.
                 highlight_oos=True, **common,
             )
         elif chart_name == "Box Plot by Vendor":
@@ -122,7 +163,7 @@ def _render_composed_chart_data(window, selected_fail_sns=None):
         else:
             v16_compact._ORIGINAL_RENDER_V16_CHART(
                 chart_data, context["columns"], chart_name, group_column=context["vendor"],
-                sample_limit=context["sample_limit"], highlight_oos=context["highlight_oos"], **common,
+                sample_limit=context["sample_limit"], highlight_oos=True, **common,
             )
         figures[chart_name] = figure
 
@@ -143,32 +184,32 @@ def _selected_sns_from_table(window):
 def _fail_selection_changed(window):
     if getattr(window, "_v18_ready", False) and window.fail_toggle.isChecked():
         selected = _selected_sns_from_table(window)
-        # Clearing selection restores the default view with every Fail Unit.
         _render_composed_chart_data(window, selected or None)
 
 
 def _build_charts_v18(self, *args, **kwargs):
+    # Capture before V16 build/rendering; do not source composition from _chart_data.
+    try:
+        full_filtered_data, captured = _capture_full_filtered_data(self)
+    except (TypeError, ValueError, KeyError):
+        full_filtered_data, captured = None, None
+
     result = _ORIGINAL_BUILD(self, *args, **kwargs)
-    source = getattr(self, "_chart_data", None)
-    if source is None or source.empty or not getattr(self, "_chart_names", None):
+    if full_filtered_data is None or full_filtered_data.empty or not getattr(self, "_chart_names", None):
         return result
-    self._v18_source_chart_data = source.copy()
+
+    self._v18_full_filtered_data = full_filtered_data.copy()
     self._v18_chart_context = {
-        "key": self.unit_key.currentText(), "columns": self.selected_columns(),
+        **captured,
         "vendor": self.vendor_column.currentText(), "facet": self.facet_column.currentText(),
         "vendor_values": self.checked(self.vendor_values), "facet_values": self.checked(self.facet_values),
-        "usl": None if self.multi_mode.isChecked() else self._number(self.usl),
-        "lsl": None if self.multi_mode.isChecked() else self._number(self.lsl),
-        "target": None if self.multi_mode.isChecked() else self._number(self.target),
-        "specs": list(getattr(self, "_last_specs", [])),
-        "spec_mode": "Multi Spec" if self.multi_mode.isChecked() else "Single Spec",
         "sample_limit": max(25, int(self.sample.text() or 350)),
-        "highlight_oos": self.fail_toggle.isChecked(), "chart_names": list(self._chart_names),
+        "highlight_oos": True, "chart_names": list(self._chart_names),
     }
     self._v18_ready = False
     self.fail_table.clearSelection()
     self._v18_ready = True
-    # Build completes in the default state: all Pass and all Fail Units visible.
+    # Default: the complete pre-render population, including every Pass and Fail.
     _render_composed_chart_data(self, None)
     return result
 
@@ -208,7 +249,6 @@ def _open_measurements_v18(self):
         ) == app_module.QMessageBox.StandardButton.Cancel:
             return
 
-        from pathlib import Path
         for sheet in chosen:
             frame = (self._read_measurement(path, sheet) if template == "Fleet Data - PE Format"
                      else read_insight_raw_sheet(path, sheet, header_row))
