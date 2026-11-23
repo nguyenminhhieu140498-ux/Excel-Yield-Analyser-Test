@@ -1,8 +1,6 @@
-# Excel Yield Analyzer — v1.8 Debug
+# Excel Yield Analyzer — V1.8 Debug
 
-V1.8 debug launcher retains the existing compact interface and import templates, keeps passing units on every chart, and adds only selected failing SN units to the chart. The Fail SN List occupies the former commonality-panel space. Target/Nominal keeps its green line and displays only its numeric value.
-
-## Run with Python 3.15
+## Run from source on Python 3.15
 
 ```bash
 python3.15 -m venv .venv
@@ -12,3 +10,21 @@ python -m pip install -r requirements.txt
 python -m pytest -v
 python engineering_chart_analyzer_v18_debug.py
 ```
+
+## Build the macOS `.app` bundle
+
+Run on macOS with Python 3.15 available as `python3.15`:
+
+```bash
+git pull --ff-only
+python3.15 build_macos_app.py
+open "dist/Excel Yield Analyzer V1.8.app"
+```
+
+The generated bundle is written to:
+
+```text
+dist/Excel Yield Analyzer V1.8.app
+```
+
+A first build may require macOS privacy prompts or Xcode Command Line Tools. The script uses PyInstaller and installs its build dependency without changing application logic.
