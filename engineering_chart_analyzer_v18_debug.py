@@ -6,16 +6,21 @@ import sys
 import pandas as pd
 from matplotlib.figure import Figure
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QHBoxLayout
 
 import engineering_chart_analyzer_v16_compact as v16_compact
 import engineering_chart_analyzer as app_module
 import engineering_charts as chart_logic
+from insight_raw_reader import read_insight_raw_sheet
 
 VERSION = "1.8 DEBUG"
 
-# Keep the already-tested renderers and Excel readers; this layer only changes
-# the requested V1.8 behavior and leaves the existing UI widgets in place.
+# Insight Raw has an independent, raw-cell reader. PE continues to use its
+# established reader unchanged through the existing template-selection path.
+v16_compact._read_insight_raw_sheet = read_insight_raw_sheet
+
+# Keep the already-tested renderers; this layer changes only the requested
+# V1.8 behavior and leaves the existing UI widgets in place.
 _ORIGINAL_INIT = app_module.EngineeringChartWindow.__init__
 _ORIGINAL_BUILD = app_module.EngineeringChartWindow.build_charts
 _ORIGINAL_DRAW_SPECS = v16_compact._ORIGINAL_DRAW_SPECS
@@ -68,8 +73,6 @@ def _remove_commonality_panel(window):
     layout = table_box.layout()
     if not isinstance(layout, QHBoxLayout):
         return
-    # The existing table remains available internally for report/export callers;
-    # only its UI panel is detached, as requested.
     if layout.count() > 1:
         summary_item = layout.takeAt(0)
         summary_layout = summary_item.layout()
@@ -189,8 +192,7 @@ def _build_charts_v18(self, *args, **kwargs):
         "chart_names": list(self._chart_names),
     }
 
-    # Compact V1.6 selects all failure rows during build; V1.8 starts with Pass
-    # Units only, then adds a failed SN only when the user explicitly selects it.
+    # Start with Pass Units and add a failing SN only when explicitly selected.
     self._v18_ready = False
     self.fail_table.clearSelection()
     self._v18_ready = True
